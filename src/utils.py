@@ -570,6 +570,23 @@ def load_math500(levels: list[int] | None = None) -> list[dict]:
     return out
 
 
+@register_dataset_eval("deepmath")
+def load_deepmath_eval(levels: list[int] | None = None) -> list[dict]:
+    """Load zwhe99/DeepMath-103K for evaluation (unique questions only)."""
+    ds = load_dataset("zwhe99/DeepMath-103K", split="train")
+    out = []
+    for i, row in enumerate(ds):
+        out.append({
+            "problem": row["question"],
+            "answer": row["final_answer"],
+            "solution": "",
+            "level": 0,
+            "subject": row.get("subject", ""),
+            "unique_id": f"deepmath_{i}",
+        })
+    return out
+
+
 @register_dataset_train("deepmath")
 def load_deepmath(
     max_samples: int | None = None,

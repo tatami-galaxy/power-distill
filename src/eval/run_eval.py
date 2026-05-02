@@ -31,7 +31,14 @@ from scalable_power_sampling import HFPowerSMCSampler
 # ---------------------------------------------------------------------------
 
 SYSTEM_PROMPT = (
-    "You are a helpful math assistant. Solve the following problem step by step. "
+    "You are a helpful math assistant. Solve the following problem step by step.  "
+    "Put your final answer in \\boxed{}."
+)
+
+SYSTEM_PROMPT_DUMB = (
+    "You are a helpful math assistant. Solve the following problem step by step.  "
+    "During thinking, only produce tokens from the following : "
+    "§, ¶, ¤, †, ‡, ※, ◦, ▪, ▫, ◆, ◇, ●, ○, ★, ☆, →, ←, ↔, ∴, ∵  .  "
     "Put your final answer in \\boxed{}."
 )
 
@@ -41,7 +48,7 @@ RAW_COT = " Please reason step by step, and put your final answer within \\boxed
 
 def format_prompt_chat(problem: str) -> list[dict]:
     return [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": SYSTEM_PROMPT_DUMB},
         {"role": "user", "content": problem},
     ]
 
@@ -105,13 +112,18 @@ def evaluate_model(
     template_tok = chat_template_tokenizer or tokenizer
     prompts = []
     for p in problems:
-        prompts.append(build_prompt(
+        prompt = build_prompt(
             p["problem"], prompt_mode, tokenizer, template_tok, enable_thinking,
-        ))
+        )
+        prompts.append(prompt)
 
     # Generate
     t0 = time.time()
     outputs = llm.generate(prompts, sampling_params)
+
+    print(outputs[0].outputs[0].text)
+    quit()
+
     elapsed = time.time() - t0
     print(f"Generation took {elapsed:.1f}s ({len(problems)/elapsed:.1f} problems/s)")
 
@@ -120,6 +132,8 @@ def evaluate_model(
     for prob, output in zip(problems, outputs):
         completion = output.outputs[0]
         response = completion.text
+        print(response)
+        quit()
         pred_answer = extract_boxed_answer(response)
         correct = is_equiv(pred_answer, prob["answer"]) if pred_answer else False
         results.append({
@@ -413,8 +427,8 @@ def save_results(eval_output: dict, output_dir: str):
 def main():
     parser = argparse.ArgumentParser(description="Evaluate models on math benchmarks")
     parser.add_argument(
-        "--model", nargs="+", required=True,
-        help="HuggingFace model name(s) or local checkpoint path(s)",
+        "--model", type=str, required=True,
+        help="HuggingFace model name or local checkpoint path",
     )
     parser.add_argument(
         "--dataset", default="math500", choices=list(DATASET_REGISTRY_EVAL.keys()),
