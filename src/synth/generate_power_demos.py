@@ -36,12 +36,6 @@ Usage:
         --dataset deepmath \
         --max_problems 1000
 
-    # Multi-GPU with tensor parallelism (TP=2, 4 GPUs → 2 workers)
-    CUDA_VISIBLE_DEVICES=0,1,2,3 uv run python -m scripts.rl.generate_power_demos \
-        --model Qwen/Qwen3-8B \
-        --dataset deepmath \
-        --tensor_parallel_size 2
-
     # Explicit worker count
     CUDA_VISIBLE_DEVICES=0,1,2,3 uv run python -m scripts.rl.generate_power_demos \
         --model Qwen/Qwen3-4B \
@@ -59,6 +53,8 @@ from datasets import load_dataset
 from tqdm import tqdm
 
 from src.utils import extract_boxed_answer, is_equiv
+
+from scalable_power_sampling import HFPowerSMCSampler
 
 
 # ---------------------------------------------------------------------------
@@ -209,52 +205,25 @@ def load_existing_results(output_path: str) -> set[str]:
 
 def _build_sampler(args):
     """Construct the requested sampler after CUDA visibility has been set."""
-    if args.sampler == "power_smc":
-        from scalable_power_sampling import HFPowerSMCSampler
 
-        return HFPowerSMCSampler(
-            model_name=args.model,
-            alpha=args.alpha,
-            n_particles=args.smc_particles,
-            ess_threshold=args.smc_ess_threshold,
-            proposal_temperature=1.0 / args.alpha,
-            block_size=args.smc_block_size,
-            alpha_ramp_tokens=args.smc_alpha_ramp_tokens,
-            max_new_tokens=args.max_tokens,
-            min_new_tokens=args.smc_min_new_tokens,
-            repetition_penalty=args.smc_repetition_penalty,
-            top_k=args.smc_top_k,
-            top_p=args.smc_top_p,
-            tensor_parallel_size=args.tensor_parallel_size,
-            max_model_len=args.max_model_len,
-            dtype=args.dtype,
-            stop_on_boxed=not args.no_smc_stop_on_boxed,
-            use_cow_cache=not args.no_smc_cow_cache,
-            shared_prompt_cache=not args.no_smc_shared_prompt_cache,
-        )
-
-    from scalable_power_sampling import VLLMBatchedPowerSampler
-    import inspect
-
-    sampler_kwargs = {
-        "model_name": args.model,
-        "alpha": args.alpha,
-        "batch_size": args.batch_size,
-        "num_candidates": args.num_candidates,
-        "top_k": args.top_k,
-        "num_rollouts": args.num_rollouts,
-        "lookahead": args.lookahead,
-        "max_new_tokens": args.max_tokens,
-        # Worker sees only its assigned GPUs (remapped to 0..TP-1).
-        "tensor_parallel_size": args.tensor_parallel_size,
-        "max_model_len": args.max_model_len,
-        "length_normalize": args.length_normalize,
-        "dtype": args.dtype,
-    }
-    signature = inspect.signature(VLLMBatchedPowerSampler.__init__)
-    if "confidence_threshold" in signature.parameters:
-        sampler_kwargs["confidence_threshold"] = args.confidence_threshold
-    return VLLMBatchedPowerSampler(**sampler_kwargs)
+    return HFPowerSMCSampler(
+        model_name=args.model,
+        alpha=args.alpha,
+        n_particles=args.smc_particles,
+        ess_threshold=args.smc_ess_threshold,
+        proposal_temperature=1.0 / args.alpha,
+        block_size=args.smc_block_size,
+        alpha_ramp_tokens=args.smc_alpha_ramp_tokens,
+        max_new_tokens=args.max_tokens,
+        min_new_tokens=args.smc_min_new_tokens,
+        repetition_penalty=args.smc_repetition_penalty,
+        top_k=args.smc_top_k,
+        top_p=args.smc_top_p,
+        dtype=args.dtype,
+        stop_on_boxed=not args.no_smc_stop_on_boxed,
+        use_cow_cache=not args.no_smc_cow_cache,
+        shared_prompt_cache=not args.no_smc_shared_prompt_cache,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -338,7 +307,6 @@ def _worker_fn(rank: int, gpu_ids: list[int], problems: list[dict],
                 "num_tokens_generated": out["num_tokens_generated"],
                 "sample_time_s": round(sample_elapsed, 2),
                 "alpha": args.alpha,
-                "sampler": args.sampler,
             }
             if "stats" in out:
                 result["smc_stats"] = out["stats"]
@@ -394,7 +362,7 @@ def _generate_sequential(problems: list[dict], args, all_path: str, num_already_
     max_responses = args.max_responses
 
     with open(all_path, "a") as f_all:
-        pbar = tqdm(total=len(problems), desc=args.sampler, unit="response")
+        pbar = tqdm(total=len(problems), desc="power smc", unit="response")
         for prob in problems:
             if max_responses is not None and num_already_done + saved_count >= max_responses:
                 break
@@ -424,7 +392,6 @@ def _generate_sequential(problems: list[dict], args, all_path: str, num_already_
                 "num_tokens_generated": out["num_tokens_generated"],
                 "sample_time_s": round(sample_elapsed, 2),
                 "alpha": args.alpha,
-                "sampler": args.sampler,
             }
             if "stats" in out:
                 result["smc_stats"] = out["stats"]
@@ -492,8 +459,7 @@ def generate(args):
     else:
         dataset_slug = args.dataset
     alpha_slug = f"alpha_{args.alpha}"
-    if args.sampler == "power_smc":
-        alpha_slug = f"power_smc_{alpha_slug}"
+    alpha_slug = f"power_smc_{alpha_slug}"
     output_dir = os.path.join(args.output_dir, dataset_slug, model_slug, alpha_slug)
     os.makedirs(output_dir, exist_ok=True)
 
@@ -519,25 +485,18 @@ def generate(args):
 
     # --- Determine parallelism ---
     gpus = _get_visible_gpus()
-    tp = args.tensor_parallel_size
-
-    if args.num_workers is not None:
-        num_workers = args.num_workers
-    else:
-        num_workers = len(gpus) // tp
-
-    num_workers = max(1, min(num_workers, len(gpus) // tp))
+    num_workers = len(gpus)
 
     if num_workers <= 1:
         # --- Sequential path ---
-        print(f"Running sequentially on {len(gpus)} GPU(s) (TP={tp})")
+        print(f"Running sequentially on {len(gpus)} GPU(s)")
         _generate_sequential(remaining, args, all_path, num_already_done=len(done))
     else:
         # --- Parallel path ---
-        print(f"Running {num_workers} workers on {len(gpus)} GPUs (TP={tp})")
+        print(f"Running {num_workers} workers on {len(gpus)} GPUs")
 
-        # Assign GPUs: worker i gets gpus[i*tp : (i+1)*tp]
-        gpu_assignments = [gpus[i * tp : (i + 1) * tp] for i in range(num_workers)]
+        # Assign GPUs: worker i gets gpus[i : (i+1)]
+        gpu_assignments = [gpus[i : (i + 1)] for i in range(num_workers)]
 
         # Partition problems round-robin for balanced shards
         shards = [[] for _ in range(num_workers)]
@@ -682,6 +641,15 @@ def main():
     parser.add_argument("--model", type=str, required=True)
     parser.add_argument("--chat_template_model", type=str, default=None,
                         help="HF model to borrow chat template from")
+    parser.add_argument("--max_tokens", type=int, default=2048,
+                        help="Max tokens per generation")
+    parser.add_argument("--max_responses", type=int, default=None,
+                        help="Stop after this many saved rows globally (across all workers, "
+                             "counting any rows already on disk from a prior run).")
+    parser.add_argument("--prompt_mode", type=str, default="chat",
+                        choices=["chat", "raw"],
+                        help="Prompt format: 'chat' uses system+user chat template, "
+                             "'raw' uses plain CoT string (for non IT models)")
 
     # Data
     parser.add_argument("--dataset", type=str, default="deepmath",
@@ -697,29 +665,10 @@ def main():
     parser.add_argument("--difficulty", nargs="*", default=None,
                         help="Polaris difficulty filter (e.g. 1/8 2/8)")
     parser.add_argument("--seed", type=int, default=42)
-
-    # Sampler
-    parser.add_argument("--sampler", type=str, default="power_sampling",
-                        choices=["power_sampling", "power_smc"],
-                        help="Generation algorithm: power_sampling (vLLM batched) or power_smc (particle filter)")
-    parser.add_argument("--alpha", type=float, default=4.0)
-    parser.add_argument("--top_k", type=int, default=8)
-    parser.add_argument("--num_rollouts", type=int, default=8)
-    parser.add_argument("--lookahead", type=int, default=192)
-    parser.add_argument("--batch_size", type=int, default=192,
-                        help="Tokens per chunk (B)")
-    parser.add_argument("--num_candidates", type=int, default=32,
-                        help="Candidate chunks per step (L)")
-    parser.add_argument("--max_tokens", type=int, default=2048,
-                        help="Max tokens per generation")
-    parser.add_argument("--max_responses", type=int, default=None,
-                        help="Stop after this many saved rows globally (across all workers, "
-                             "counting any rows already on disk from a prior run).")
-    parser.add_argument("--confidence_threshold", type=float, default=None,
-                        help="Skip rollouts when top-1 vs top-2 gap exceeds this")
-    parser.add_argument("--length_normalize", action="store_true")
+    parser.add_argument("--output_dir", type=str, default="results/power_demos")
 
     # Power-SMC
+    parser.add_argument("--alpha", type=float, default=4.0)
     parser.add_argument("--smc_particles", type=int, default=64,
                         help="Number of Power-SMC particles")
     parser.add_argument("--smc_ess_threshold", type=float, default=0.5,
@@ -744,23 +693,7 @@ def main():
                         help="Process the prompt separately for every SMC particle")
     parser.add_argument("--dtype", type=str, default="bfloat16",
                         choices=["float16", "bfloat16", "float32", "auto"],
-                        help="Model dtype")
-
-    # vLLM / parallelism
-    parser.add_argument("--tensor_parallel_size", type=int, default=1,
-                        help="GPUs per sampler instance (tensor parallelism)")
-    parser.add_argument("--max_model_len", type=int, default=8192)
-    parser.add_argument("--num_workers", type=int, default=None,
-                        help="Number of parallel workers (default: auto = num_gpus // tensor_parallel_size)")
-
-    # Prompt
-    parser.add_argument("--prompt_mode", type=str, default="chat",
-                        choices=["chat", "raw"],
-                        help="Prompt format: 'chat' uses system+user chat template, "
-                             "'raw' uses plain CoT string (matches Power-SMC reference)")
-
-    # Output
-    parser.add_argument("--output_dir", type=str, default="results/power_demos")
+                        help="Model dtype")    
 
     args = parser.parse_args()
     generate(args)

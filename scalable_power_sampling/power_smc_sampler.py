@@ -551,19 +551,11 @@ class HFPowerSMCSampler:
         repetition_penalty: float = 1.0,
         top_k: int = 0,
         top_p: float = 1.0,
-        tensor_parallel_size: int = 1,
-        max_model_len: int | None = None,
         dtype: str = "bfloat16",
         stop_on_boxed: bool = True,
         use_cow_cache: bool = True,
         shared_prompt_cache: bool = True,
     ):
-        if tensor_parallel_size != 1:
-            print(
-                "HFPowerSMCSampler uses Transformers device_map='auto'; "
-                "--tensor_parallel_size is only used by vLLM samplers."
-            )
-
         self.config = PowerSMCConfig(
             max_new_tokens=max_new_tokens,
             alpha=alpha,
@@ -592,8 +584,6 @@ class HFPowerSMCSampler:
             "torch_dtype": _torch_dtype(dtype),
             "trust_remote_code": False,
         }
-        if max_model_len is not None:
-            model_kwargs["max_position_embeddings"] = max_model_len
         if torch.cuda.is_available():
             model_kwargs["device_map"] = "auto"
 
