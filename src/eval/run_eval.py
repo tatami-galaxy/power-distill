@@ -73,7 +73,6 @@ def evaluate_model(
     max_tokens: int = 2048,
     temperature: float = 0.0,
     tensor_parallel_size: int = 1,
-    max_model_len: int | None = 4096,
     chat_template_tokenizer=None,
     enable_thinking: bool | None = None,
     dtype: str = "bfloat16",
@@ -92,8 +91,6 @@ def evaluate_model(
         trust_remote_code=True,
         dtype=dtype,
     )
-    if max_model_len is not None:
-        llm_kwargs["max_model_len"] = max_model_len
     llm = LLM(**llm_kwargs)
     tokenizer = llm.get_tokenizer()
     sampling_params = SamplingParams(
@@ -153,8 +150,6 @@ def evaluate_model_power_smc(
     top_k: int = 0,
     top_p: float = 1.0,
     repetition_penalty: float = 1.0,
-    tensor_parallel_size: int = 1,
-    max_model_len: int | None = 4096,
     chat_template_tokenizer=None,
     enable_thinking: bool | None = None,
     dtype: str = "bfloat16",
@@ -195,8 +190,6 @@ def evaluate_model_power_smc(
         repetition_penalty=repetition_penalty,
         top_k=top_k,
         top_p=top_p,
-        tensor_parallel_size=tensor_parallel_size,
-        max_model_len=max_model_len,
         dtype=dtype,
         stop_on_boxed=stop_on_boxed,
         use_cow_cache=use_cow_cache,
@@ -434,8 +427,6 @@ def main():
     parser.add_argument("--max_tokens", type=int, default=4096)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--tensor_parallel_size", type=int, default=1)
-    parser.add_argument("--max_model_len", type=int, default=8192,
-                        help="Max context length for vLLM KV cache. Use 0 for model default.")
     parser.add_argument("--num_samples", type=int, default=None,
                         help="Evaluate on a random subset of N samples (useful for quick tests)")
     parser.add_argument("--seed", type=int, default=42,
@@ -517,7 +508,6 @@ def main():
         max_tokens=args.max_tokens,
         temperature=args.temperature,
         tensor_parallel_size=args.tensor_parallel_size,
-        max_model_len=args.max_model_len or None,
         chat_template_tokenizer=chat_template_tokenizer,
         enable_thinking=args.enable_thinking,
         dtype=args.dtype,
@@ -541,8 +531,6 @@ def main():
             top_k=args.smc_top_k,
             top_p=args.smc_top_p,
             repetition_penalty=args.smc_repetition_penalty,
-            tensor_parallel_size=args.tensor_parallel_size,
-            max_model_len=args.max_model_len or None,
             chat_template_tokenizer=chat_template_tokenizer,
             enable_thinking=args.enable_thinking,
             dtype=args.dtype,
