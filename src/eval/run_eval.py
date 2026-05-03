@@ -35,20 +35,13 @@ SYSTEM_PROMPT = (
     "Put your final answer in \\boxed{}."
 )
 
-SYSTEM_PROMPT_DUMB = (
-    "You are a helpful math assistant. Solve the following problem step by step.  "
-    "During thinking, only produce tokens from the following : "
-    "§, ¶, ¤, †, ‡, ※, ◦, ▪, ▫, ◆, ◇, ●, ○, ★, ☆, →, ←, ↔, ∴, ∵  .  "
-    "Put your final answer in \\boxed{}."
-)
-
 RAW_PROMPT = "Can you solve the following math problem? "
 RAW_COT = " Please reason step by step, and put your final answer within \\boxed{}."
 
 
 def format_prompt_chat(problem: str) -> list[dict]:
     return [
-        {"role": "system", "content": SYSTEM_PROMPT_DUMB},
+        {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": problem},
     ]
 
@@ -121,9 +114,6 @@ def evaluate_model(
     t0 = time.time()
     outputs = llm.generate(prompts, sampling_params)
 
-    print(outputs[0].outputs[0].text)
-    quit()
-
     elapsed = time.time() - t0
     print(f"Generation took {elapsed:.1f}s ({len(problems)/elapsed:.1f} problems/s)")
 
@@ -132,8 +122,6 @@ def evaluate_model(
     for prob, output in zip(problems, outputs):
         completion = output.outputs[0]
         response = completion.text
-        print(response)
-        quit()
         pred_answer = extract_boxed_answer(response)
         correct = is_equiv(pred_answer, prob["answer"]) if pred_answer else False
         results.append({
