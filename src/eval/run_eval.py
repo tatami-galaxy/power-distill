@@ -84,7 +84,6 @@ def evaluate_model(
     print(f"Problems:   {len(problems)}")
     print(f"{'='*60}")
 
-    # TODO : fix_mistral_regex=True?
     llm_kwargs = dict(
         model=model_name,
         tensor_parallel_size=tensor_parallel_size,
@@ -424,7 +423,7 @@ def main():
                         choices=["chat", "raw"],
                         help="Prompt format: 'chat' uses system+user chat template, "
                              "'raw' uses plain CoT string (matches Power-SMC reference for base models)")
-    parser.add_argument("--max_tokens", type=int, default=4096)
+    parser.add_argument("--max_tokens", type=int, default=2048)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--tensor_parallel_size", type=int, default=1)
     parser.add_argument("--num_samples", type=int, default=None,

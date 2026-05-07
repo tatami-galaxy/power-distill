@@ -78,17 +78,11 @@ SYSTEM_PROMPT = (
     "Put your final answer in \\boxed{}."
 )
 
-TEACHER_TEMPLATE_1 = (
+TEACHER_TEMPLATE = (
     "{question}\n\n"
     "This is an example for a response to the question:\n"
     "{demonstration}\n\n"
     "Now answer with a response of your own, including the thinking process:"
-)
-TEACHER_TEMPLATE_2 = (
-    "{question}\n\n"
-    "Here is a reference solution:\n"
-    "{demonstration}\n\n"
-    "After understanding the reference solution, please try to solve this problem using your own approach:"
 )
 
 
@@ -113,8 +107,7 @@ def format_sdft(example):
     ]
     teacher_messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        #{"role": "user", "content": TEACHER_TEMPLATE_1.format(
-        {"role": "user", "content": TEACHER_TEMPLATE_2.format(
+        {"role": "user", "content": TEACHER_TEMPLATE.format(
             question=question, demonstration=solution
         )},
     ]

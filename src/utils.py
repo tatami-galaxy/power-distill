@@ -587,46 +587,78 @@ def load_deepmath_eval(levels: list[int] | None = None) -> list[dict]:
     return out
 
 
+@register_dataset_eval("polaris")
+def load_polaris_eval(levels: list[int] | None = None) -> list[dict]:
+    """Load POLARIS-Project/Polaris-Dataset-53K for evaluation."""
+    ds = load_dataset("POLARIS-Project/Polaris-Dataset-53K", split="train")
+    out = []
+    for i, row in enumerate(ds):
+        if row["answer"] is None or len(row["answer"].strip()) == 0:
+            continue
+        out.append({
+            "problem": row["problem"],
+            "answer": row["answer"],
+            "solution": "",
+            "level": 0,
+            "subject": row.get("difficulty", ""),
+            "unique_id": f"polaris_{i}",
+        })
+    return out
+
+
 @register_dataset_train("deepmath")
 def load_deepmath(
     max_samples: int | None = None,
     seed: int = 42,
+    explode_solutions: bool = True,
 ) -> "Dataset":
-    """Load zwhe99/DeepMath-103K, exploding 3 solution columns into separate rows.
+    """Load zwhe99/DeepMath-103K.
 
-    Each example is tripled: one row per r1_solution_{1,2,3}. The columns are
-    mapped to 'problem', 'solution', and 'answer' to match the existing format.
+    When *explode_solutions* is True (default, for SFT), each example is
+    tripled: one row per r1_solution_{1,2,3} with columns problem/solution/answer.
+
+    When *explode_solutions* is False (for GRPO/RL), only problem and answer
+    are kept (no solution column, no tripling).
     """
-    from datasets import concatenate_datasets
-
     ds = load_dataset("zwhe99/DeepMath-103K", split="train")
 
-    # Explode: create 3 copies of each row, one per solution column
-    def _make_split(sol_col):
-        return ds.map(
-            lambda x: {"problem": x["question"], "solution": x[sol_col], "answer": x["final_answer"]},
+    if explode_solutions:
+        from datasets import concatenate_datasets
+
+        def _make_split(sol_col):
+            return ds.map(
+                lambda x: {"problem": x["question"], "solution": x[sol_col], "answer": x["final_answer"]},
+                remove_columns=ds.column_names,
+                num_proc=4,
+            )
+
+        ds = concatenate_datasets([
+            _make_split("r1_solution_1"),
+            _make_split("r1_solution_2"),
+            _make_split("r1_solution_3"),
+        ])
+
+        ds = ds.filter(
+            lambda x: x["solution"] is not None and len(x["solution"].strip()) > 0,
+            num_proc=4,
+        )
+    else:
+        ds = ds.map(
+            lambda x: {"problem": x["question"], "answer": x["final_answer"]},
             remove_columns=ds.column_names,
             num_proc=4,
         )
+        ds = ds.filter(
+            lambda x: x["answer"] is not None and len(x["answer"].strip()) > 0,
+            num_proc=4,
+        )
 
-    ds_exploded = concatenate_datasets([
-        _make_split("r1_solution_1"),
-        _make_split("r1_solution_2"),
-        _make_split("r1_solution_3"),
-    ])
-
-    # Drop rows with empty solutions
-    ds_exploded = ds_exploded.filter(
-        lambda x: x["solution"] is not None and len(x["solution"].strip()) > 0,
-        num_proc=4,
-    )
-
-    ds_exploded = ds_exploded.shuffle(seed=seed)
+    ds = ds.shuffle(seed=seed)
 
     if max_samples:
-        ds_exploded = ds_exploded.select(range(min(max_samples, len(ds_exploded))))
+        ds = ds.select(range(min(max_samples, len(ds))))
 
-    return ds_exploded
+    return ds
 
 
 @register_dataset_train("openthoughts")
@@ -668,6 +700,60 @@ def load_openthoughts(
         ),
         num_proc=4,
     )
+
+    ds = ds.shuffle(seed=seed)
+
+    if max_samples:
+        ds = ds.select(range(min(max_samples, len(ds))))
+
+    return ds
+
+
+@register_dataset_train("numinamath")
+def load_numinamath(
+    max_samples: int | None = None,
+    sources: list[str] | None = None,
+    seed: int = 42,
+) -> "Dataset":
+    """Load NuminaMath-1.5 with optional source filtering."""
+    ds = load_dataset("AI-MO/NuminaMath-1.5", split="train")
+
+    ds = ds.filter(
+        lambda x: (
+            x["problem_is_valid"] == "Yes"
+            and x["answer"] is not None
+            and len(x["answer"].strip()) > 0
+        ),
+        num_proc=4,
+    )
+
+    if sources:
+        ds = ds.filter(lambda x: x["source"] in sources, num_proc=4)
+
+    ds = ds.shuffle(seed=seed)
+
+    if max_samples:
+        ds = ds.select(range(min(max_samples, len(ds))))
+
+    return ds
+
+
+@register_dataset_train("polaris")
+def load_polaris(
+    max_samples: int | None = None,
+    difficulty: list[str] | None = None,
+    seed: int = 42,
+) -> "Dataset":
+    """Load POLARIS-Project/Polaris-Dataset-53K with optional difficulty filtering."""
+    ds = load_dataset("POLARIS-Project/Polaris-Dataset-53K", split="train")
+
+    ds = ds.filter(
+        lambda x: x["answer"] is not None and len(x["answer"].strip()) > 0,
+        num_proc=4,
+    )
+
+    if difficulty:
+        ds = ds.filter(lambda x: x["difficulty"] in difficulty, num_proc=4)
 
     ds = ds.shuffle(seed=seed)
 
