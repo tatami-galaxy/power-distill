@@ -5,8 +5,8 @@ Outcome-based reward: +1 if the model's boxed answer matches the gold answer, 0 
 
     # Multi GPU
     CUDA_VISIBLE_DEVICES=4,5,6,7 uv run accelerate launch \
-        --config_file configs/multi_gpu_4.yaml \
-        -m src.train.train_rl --model Qwen/Qwen3-4B \
+        --config_file configs/ddp_4.yaml \
+        -m src.train.train_grpo --model Qwen/Qwen3-4B \
         --dataset deepmath --max_steps 1000 --logging_steps 10 \
         --save_steps 50 --gradient_accumulation_steps 4 \
         --save_total_limit 3 --per_device_batch_size 1 \
@@ -26,27 +26,69 @@ from src.utils import extract_boxed_answer, is_equiv, DATASET_REGISTRY_TRAIN
 
 
 # ---------------------------------------------------------------------------
-# Reward function
+# Reward function (with all-wrong tracking)
 # ---------------------------------------------------------------------------
 
-def accuracy_reward(completions, answer, **kwargs):
-    """Outcome-based reward: 1.0 if predicted answer matches gold, 0.0 otherwise.
+class AccuracyRewardWithBuffer:
+    """Outcome-based reward that also tracks prompts where all rollouts fail.
 
-    The `answer` kwarg comes from the dataset column of the same name.
+    When all `num_generations` rollouts for a prompt score 0, the prompt and
+    gold answer are appended to a JSONL buffer file for later analysis /
+    power-sampling recovery.
     """
-    rewards = []
-    for completion, gold in zip(completions, answer):
-        # Handle conversational format (list of message dicts)
-        if isinstance(completion, list):
-            text = completion[-1]["content"]
-        else:
-            text = completion
-        pred = extract_boxed_answer(text)
-        if pred is not None and is_equiv(pred, gold):
-            rewards.append(1.0)
-        else:
-            rewards.append(0.0)
-    return rewards
+
+    __name__ = "accuracy_reward"
+
+    def __init__(self, num_generations: int, buffer_path: str):
+        self.num_generations = num_generations
+        self.buffer_path = buffer_path
+        self.total_prompts = 0
+        self.all_wrong_prompts = 0
+
+        # Ensure the buffer directory exists and start fresh
+        os.makedirs(os.path.dirname(buffer_path) or ".", exist_ok=True)
+        if os.path.exists(buffer_path):
+            os.remove(buffer_path)
+
+    def __call__(self, completions, answer, prompts=None, **kwargs):
+        rewards = []
+        for completion, gold in zip(completions, answer):
+            if isinstance(completion, list):
+                text = completion[-1]["content"]
+            else:
+                text = completion
+            pred = extract_boxed_answer(text)
+            if pred is not None and is_equiv(pred, gold):
+                rewards.append(1.0)
+            else:
+                rewards.append(0.0)
+
+        # Group by prompt (every num_generations entries) and detect all-wrong
+        G = self.num_generations
+        for i in range(0, len(rewards), G):
+            group_rewards = rewards[i : i + G]
+            self.total_prompts += 1
+            if sum(group_rewards) == 0.0:
+                self.all_wrong_prompts += 1
+                # Save prompt + answer for power-sampling recovery
+                entry = {
+                    "prompt": prompts[i] if prompts is not None else None,
+                    "answer": answer[i],
+                    "step": kwargs.get("trainer_state", None)
+                    and kwargs["trainer_state"].global_step,
+                }
+                with open(self.buffer_path, "a") as f:
+                    f.write(json.dumps(entry) + "\n")
+
+            # Log running stats every 100 prompts
+            if self.total_prompts % 100 == 0:
+                pct = 100 * self.all_wrong_prompts / self.total_prompts
+                print(
+                    f"[AllWrong] {self.all_wrong_prompts}/{self.total_prompts} "
+                    f"prompts ({pct:.1f}%) had zero correct rollouts"
+                )
+
+        return rewards
 
 
 # ---------------------------------------------------------------------------
@@ -159,11 +201,18 @@ def train(args):
         report_to="tensorboard",
     )
 
+    # Reward function with all-wrong buffer
+    buffer_path = os.path.join(args.output_dir, "all_wrong_buffer.jsonl")
+    reward_fn = AccuracyRewardWithBuffer(
+        num_generations=args.num_generations,
+        buffer_path=buffer_path,
+    )
+
     # Trainer
     trainer = GRPOTrainer(
         model=model,
         args=training_args,
-        reward_funcs=accuracy_reward,
+        reward_funcs=reward_fn,
         train_dataset=ds,
         processing_class=tokenizer,
         peft_config=peft_config,
@@ -200,6 +249,16 @@ def train(args):
 
     # Train
     trainer.train()
+
+    # Print all-wrong summary
+    if reward_fn.total_prompts > 0:
+        pct = 100 * reward_fn.all_wrong_prompts / reward_fn.total_prompts
+        print(f"\n{'='*60}")
+        print(f"All-wrong summary:")
+        print(f"  Total prompts seen:   {reward_fn.total_prompts}")
+        print(f"  All-wrong prompts:    {reward_fn.all_wrong_prompts} ({pct:.1f}%)")
+        print(f"  Buffer saved to:      {buffer_path}")
+        print(f"{'='*60}\n")
 
     # Save training config for reproducibility
     config_path = os.path.join(args.output_dir, "train_config.json")
