@@ -336,6 +336,10 @@ def main():
                         help="HF model to borrow chat template from (e.g. instruct variant for a base model)")
 
     args = parser.parse_args()
+
+    # add model name to output_dir
+    args.output_dir = args.output_dir+"/"+args.model.replace("/","_")
+    
     train(args)
 
 
