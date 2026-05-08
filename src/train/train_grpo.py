@@ -338,7 +338,7 @@ def main():
     args = parser.parse_args()
 
     # add model name to output_dir
-    args.output_dir = args.output_dir+"/"+args.model.replace("/","_")
+    args.output_dir = args.output_dir+"/"+args.dataset+"/"+args.model.replace("/","_")
     
     train(args)
 
