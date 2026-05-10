@@ -4,12 +4,18 @@ Run Power-SMC on GRPO's "all-wrong" buffer to measure recovery rate.
 Reads the JSONL buffer produced by train_grpo.py (prompts where all G rollouts
 scored 0) and attempts to recover correct solutions via power sampling.
 
-Usage:
-
+One-shot mode:
     CUDA_VISIBLE_DEVICES=0 uv run python -m src.eval.ps_all_wrong \
         --model Qwen/Qwen3-4B \
         --buffer results/rl/all_wrong_buffer.jsonl \
         --alpha 4 --smc_particles 64
+
+Watch mode (runs alongside GRPO, polls for new entries):
+    CUDA_VISIBLE_DEVICES=4 uv run python -m src.eval.ps_all_wrong \
+        --model Qwen/Qwen3-4B \
+        --buffer results/rl/all_wrong_buffer.jsonl \
+        --recovered results/rl/recovered_buffer.jsonl \
+        --watch --watch_interval 30
 """
 
 import argparse
@@ -23,58 +29,39 @@ from src.utils import extract_boxed_answer, is_equiv
 from src.eval.run_eval import build_prompt
 
 
-def load_buffer(path: str) -> list[dict]:
-    """Load all-wrong buffer JSONL. Each line has: prompt, answer, step."""
+def _get_problem_text(entry):
+    if entry["prompt"] is not None:
+        for msg in entry["prompt"]:
+            if msg["role"] == "user":
+                return msg["content"]
+    return ""
+
+
+def load_buffer(path: str, seen_keys: set | None = None) -> list[dict]:
+    """Load all-wrong buffer JSONL. Returns only new (unseen) entries."""
+    if seen_keys is None:
+        seen_keys = set()
     entries = []
-    seen = set()
+    if not os.path.exists(path):
+        return entries
     with open(path) as f:
         for line in f:
             entry = json.loads(line)
-            # Deduplicate by answer + problem text
-            problem_text = ""
-            if entry["prompt"] is not None:
-                for msg in entry["prompt"]:
-                    if msg["role"] == "user":
-                        problem_text = msg["content"]
-                        break
+            problem_text = _get_problem_text(entry)
             key = (problem_text, entry["answer"])
-            if key not in seen:
-                seen.add(key)
+            if key not in seen_keys:
+                seen_keys.add(key)
                 entries.append(entry)
-    print(f"Loaded {len(entries)} unique all-wrong prompts from {path}")
     return entries
 
 
-def run_power_sampling(
-    model_name: str,
-    entries: list[dict],
-    alpha: float,
-    n_particles: int,
-    max_tokens: int,
-    ess_threshold: float,
-    block_size: int,
-    alpha_ramp_tokens: int,
-    min_new_tokens: int,
-    top_k: int,
-    top_p: float,
-    repetition_penalty: float,
-    dtype: str,
-    stop_on_boxed: bool,
-    use_cow_cache: bool,
-    shared_prompt_cache: bool,
-    chat_template_model: str | None,
-    enable_thinking: bool | None,
-    prompt_mode: str,
-) -> dict:
+def create_sampler(
+    model_name, alpha, n_particles, ess_threshold, block_size,
+    alpha_ramp_tokens, max_tokens, min_new_tokens, top_k, top_p,
+    repetition_penalty, dtype, stop_on_boxed, use_cow_cache,
+    shared_prompt_cache, chat_template_model,
+):
     temperature = 1.0 / alpha
-
-    print(f"\n{'='*60}")
-    print(f"Power-SMC recovery on {len(entries)} all-wrong prompts")
-    print(f"  model={model_name}")
-    print(f"  alpha={alpha}, particles={n_particles}, temp={temperature:.4f}")
-    print(f"  block_size={block_size}, alpha_ramp_tokens={alpha_ramp_tokens}")
-    print(f"{'='*60}")
-
     sampler = HFPowerSMCSampler(
         model_name=model_name,
         alpha=alpha,
@@ -93,120 +80,136 @@ def run_power_sampling(
         use_cow_cache=use_cow_cache,
         shared_prompt_cache=shared_prompt_cache,
     )
-    tokenizer = sampler.tokenizer
-
-    template_tok = tokenizer
+    template_tok = sampler.tokenizer
     if chat_template_model:
         from transformers import AutoTokenizer
         template_tok = AutoTokenizer.from_pretrained(
             chat_template_model, trust_remote_code=True
         )
+    return sampler, template_tok
 
+
+def recover_one(sampler, template_tok, entry, prompt_mode, enable_thinking):
+    """Power-sample one entry. Returns result dict with 'correct' flag."""
+    tokenizer = sampler.tokenizer
+    problem_text = _get_problem_text(entry)
+    gold = entry["answer"]
+
+    prompt_str = build_prompt(
+        problem_text, prompt_mode, tokenizer, template_tok, enable_thinking,
+    )
+    input_ids = tokenizer.encode(prompt_str)
+
+    t0 = time.time()
+    out = sampler.generate(input_ids=input_ids, verbose=False)
+    elapsed = time.time() - t0
+
+    response = out["text"]
+    pred_answer = extract_boxed_answer(response)
+    correct = is_equiv(pred_answer, gold) if pred_answer else False
+
+    return {
+        "prompt": entry["prompt"],
+        "answer": gold,
+        "completions": entry.get("completions"),  # original wrong rollouts
+        "power_response": response,
+        "pred_answer": pred_answer,
+        "correct": correct,
+        "num_tokens_generated": out["num_tokens_generated"],
+        "sample_time_s": elapsed,
+        "smc_stats": out.get("stats", {}),
+        "grpo_step": entry.get("step"),
+    }
+
+
+def run_power_sampling(sampler, template_tok, entries, prompt_mode,
+                       enable_thinking, recovered_path=None):
+    """Run power sampling on a batch of entries. Streams recovered results to disk."""
     results = []
     recovered = 0
-    t0 = time.time()
 
     pbar = tqdm(entries, desc="power_smc_recovery", unit="problem")
     for i, entry in enumerate(pbar):
-        # Extract problem text from chat prompt
-        problem_text = ""
-        if entry["prompt"] is not None:
-            for msg in entry["prompt"]:
-                if msg["role"] == "user":
-                    problem_text = msg["content"]
-                    break
+        result = recover_one(sampler, template_tok, entry, prompt_mode, enable_thinking)
+        results.append(result)
 
-        gold = entry["answer"]
-
-        prompt_str = build_prompt(
-            problem_text, prompt_mode, tokenizer, template_tok, enable_thinking,
-        )
-        input_ids = tokenizer.encode(prompt_str)
-
-        sample_t0 = time.time()
-        out = sampler.generate(input_ids=input_ids, verbose=False)
-        sample_elapsed = time.time() - sample_t0
-
-        response = out["text"]
-        pred_answer = extract_boxed_answer(response)
-        correct = is_equiv(pred_answer, gold) if pred_answer else False
-        recovered += int(correct)
-
-        stats = out.get("stats", {})
-        results.append({
-            "problem": problem_text,
-            "answer": gold,
-            "grpo_step": entry.get("step"),
-            "response": response,
-            "pred_answer": pred_answer,
-            "correct": correct,
-            "num_tokens_generated": out["num_tokens_generated"],
-            "sample_time_s": sample_elapsed,
-            "smc_stats": stats,
-        })
+        if result["correct"]:
+            recovered += 1
+            # Stream recovered entries to disk immediately
+            if recovered_path and result["completions"] is not None:
+                with open(recovered_path, "a") as f:
+                    f.write(json.dumps({
+                        "prompt": result["prompt"],
+                        "answer": result["answer"],
+                        "completions": result["completions"],
+                        "power_response": result["power_response"],
+                    }) + "\n")
 
         pbar.set_postfix(
             recovered=f"{recovered}/{i+1}",
             rate=f"{100*recovered/(i+1):.1f}%",
-            tokens=out["num_tokens_generated"],
-            time=f"{sample_elapsed:.1f}s",
+            tokens=result["num_tokens_generated"],
+            time=f"{result['sample_time_s']:.1f}s",
         )
 
-    elapsed = time.time() - t0
+    if entries:
+        print(f"[Recovery] {recovered}/{len(entries)} "
+              f"({100*recovered/len(entries):.1f}%) recovered")
 
-    print(f"\n{'='*60}")
-    print(f"Recovery results:")
-    print(f"  Total all-wrong prompts: {len(entries)}")
-    print(f"  Recovered by Power-SMC:  {recovered} ({100*recovered/len(entries):.1f}%)")
-    print(f"  Still unsolved:          {len(entries)-recovered}")
-    print(f"  Total time:              {elapsed:.1f}s")
-    print(f"{'='*60}")
-
-    return {
-        "model": model_name,
-        "total": len(entries),
-        "recovered": recovered,
-        "recovery_rate": recovered / len(entries) if entries else 0,
-        "elapsed_s": elapsed,
-        "power_smc_config": {
-            "alpha": alpha,
-            "n_particles": n_particles,
-            "ess_threshold": ess_threshold,
-            "temperature": temperature,
-            "block_size": block_size,
-            "alpha_ramp_tokens": alpha_ramp_tokens,
-        },
-        "results": results,
-    }
+    return results, recovered
 
 
-def save_results(output: dict, output_dir: str):
+def run_watch_mode(sampler, template_tok, buffer_path, recovered_path,
+                   prompt_mode, enable_thinking, watch_interval):
+    """Continuously poll buffer for new all-wrong entries and power-sample them."""
+    seen_keys = set()
+    total_processed = 0
+    total_recovered = 0
+
+    print(f"[Watch] Polling {buffer_path} every {watch_interval}s")
+    print(f"[Watch] Writing recovered entries to {recovered_path}")
+
+    os.makedirs(os.path.dirname(recovered_path) or ".", exist_ok=True)
+
+    while True:
+        new_entries = load_buffer(buffer_path, seen_keys)
+        if new_entries:
+            print(f"\n[Watch] Found {len(new_entries)} new all-wrong entries")
+            _, recovered = run_power_sampling(
+                sampler, template_tok, new_entries, prompt_mode,
+                enable_thinking, recovered_path,
+            )
+            total_processed += len(new_entries)
+            total_recovered += recovered
+            rate = 100 * total_recovered / total_processed if total_processed else 0
+            print(f"[Watch] Cumulative: {total_recovered}/{total_processed} "
+                  f"({rate:.1f}%) recovered")
+        else:
+            print(f"[Watch] No new entries, sleeping {watch_interval}s...")
+
+        time.sleep(watch_interval)
+
+
+def save_results(results, recovered_count, output_dir, model_name, config):
     os.makedirs(output_dir, exist_ok=True)
 
-    # Full results
+    total = len(results)
     results_path = os.path.join(output_dir, "recovery_results.json")
     with open(results_path, "w") as f:
-        json.dump(output["results"], f, indent=2)
+        json.dump(results, f, indent=2)
 
-    # Recovered samples only (for future SDFT)
-    recovered_path = os.path.join(output_dir, "recovered_for_sdft.jsonl")
-    with open(recovered_path, "w") as f:
-        for r in output["results"]:
-            if r["correct"]:
-                f.write(json.dumps({
-                    "problem": r["problem"],
-                    "answer": r["answer"],
-                    "response": r["response"],
-                }) + "\n")
-
-    # Summary
-    summary = {k: v for k, v in output.items() if k != "results"}
+    summary = {
+        "model": model_name,
+        "total": total,
+        "recovered": recovered_count,
+        "recovery_rate": recovered_count / total if total else 0,
+        "power_smc_config": config,
+    }
     summary_path = os.path.join(output_dir, "recovery_summary.json")
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
 
     print(f"\nSaved: {results_path}")
-    print(f"Saved: {recovered_path} ({output['recovered']} samples for SDFT)")
     print(f"Saved: {summary_path}")
 
 
@@ -217,17 +220,26 @@ def main():
     parser.add_argument("--model", type=str, required=True)
     parser.add_argument("--buffer", type=str, required=True,
                         help="Path to all_wrong_buffer.jsonl from train_grpo.py")
+    parser.add_argument("--recovered", type=str, default=None,
+                        help="Path to write recovered_buffer.jsonl (for Phase 3). "
+                             "Defaults to <buffer_dir>/recovered_buffer.jsonl")
     parser.add_argument("--output_dir", type=str, default="results/recovery")
     parser.add_argument("--max_tokens", type=int, default=2048)
     parser.add_argument("--prompt_mode", type=str, default="chat",
                         choices=["chat", "raw"])
     parser.add_argument("--num_samples", type=int, default=None,
-                        help="Only evaluate first N entries from buffer")
+                        help="Only evaluate first N entries from buffer (one-shot mode)")
     parser.add_argument("--chat_template_model", type=str, default=None)
     parser.add_argument("--enable-thinking", action=argparse.BooleanOptionalAction,
                         default=None)
     parser.add_argument("--dtype", type=str, default="bfloat16",
                         choices=["float16", "bfloat16", "float32", "auto"])
+
+    # Watch mode
+    parser.add_argument("--watch", action="store_true",
+                        help="Continuously poll buffer for new entries (run alongside GRPO)")
+    parser.add_argument("--watch_interval", type=int, default=30,
+                        help="Seconds between polls in watch mode")
 
     # Power-SMC args
     parser.add_argument("--alpha", type=float, default=4.0)
@@ -245,22 +257,21 @@ def main():
 
     args = parser.parse_args()
 
-    # Load buffer
-    entries = load_buffer(args.buffer)
-    if args.num_samples is not None:
-        entries = entries[:args.num_samples]
-        print(f"  Using first {len(entries)} entries")
+    # Default recovered path next to buffer
+    if args.recovered is None:
+        args.recovered = os.path.join(
+            os.path.dirname(args.buffer), "recovered_buffer.jsonl"
+        )
 
-    # Run power sampling
-    output = run_power_sampling(
+    # Create sampler once
+    sampler, template_tok = create_sampler(
         model_name=args.model,
-        entries=entries,
         alpha=args.alpha,
         n_particles=args.smc_particles,
-        max_tokens=args.max_tokens,
         ess_threshold=args.smc_ess_threshold,
         block_size=args.smc_block_size,
         alpha_ramp_tokens=args.smc_alpha_ramp_tokens,
+        max_tokens=args.max_tokens,
         min_new_tokens=args.smc_min_new_tokens,
         top_k=args.smc_top_k,
         top_p=args.smc_top_p,
@@ -270,13 +281,38 @@ def main():
         use_cow_cache=not args.no_smc_cow_cache,
         shared_prompt_cache=not args.no_smc_shared_prompt_cache,
         chat_template_model=args.chat_template_model,
-        enable_thinking=args.enable_thinking,
-        prompt_mode=args.prompt_mode,
     )
 
-    # Save
-    model_slug = args.model.replace("/", "_")
-    save_results(output, os.path.join(args.output_dir, model_slug))
+    if args.watch:
+        run_watch_mode(
+            sampler, template_tok, args.buffer, args.recovered,
+            args.prompt_mode, args.enable_thinking, args.watch_interval,
+        )
+    else:
+        # One-shot mode
+        entries = load_buffer(args.buffer)
+        if not entries:
+            print("Buffer is empty or does not exist yet.")
+            return
+        if args.num_samples is not None:
+            entries = entries[:args.num_samples]
+            print(f"  Using first {len(entries)} entries")
+
+        results, recovered = run_power_sampling(
+            sampler, template_tok, entries, args.prompt_mode,
+            args.enable_thinking, args.recovered,
+        )
+
+        # Save full results
+        config = {
+            "alpha": args.alpha, "n_particles": args.smc_particles,
+            "ess_threshold": args.smc_ess_threshold,
+            "block_size": args.smc_block_size,
+            "alpha_ramp_tokens": args.smc_alpha_ramp_tokens,
+        }
+        model_slug = args.model.replace("/", "_")
+        save_results(results, recovered, os.path.join(args.output_dir, model_slug),
+                     args.model, config)
 
 
 if __name__ == "__main__":

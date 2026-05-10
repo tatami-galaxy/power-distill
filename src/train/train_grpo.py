@@ -22,6 +22,8 @@ from peft import LoraConfig
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl import GRPOConfig, GRPOTrainer
 
+from datasets import Dataset
+
 from src.utils import extract_boxed_answer, is_equiv, DATASET_REGISTRY_TRAIN
 
 
@@ -50,37 +52,66 @@ class AccuracyRewardWithBuffer:
         if os.path.exists(buffer_path):
             os.remove(buffer_path)
 
+    def _completion_to_text(self, completion):
+        if isinstance(completion, list):
+            return completion[-1]["content"]
+        return completion
+
+    @staticmethod
+    def _prompt_key(prompt):
+        """Hashable key from a chat-message prompt list."""
+        if prompt is None:
+            return None
+        for msg in prompt:
+            if msg["role"] == "user":
+                return msg["content"]
+        return str(prompt)
+
     def __call__(self, completions, answer, prompts=None, **kwargs):
         rewards = []
         for completion, gold in zip(completions, answer):
-            if isinstance(completion, list):
-                text = completion[-1]["content"]
-            else:
-                text = completion
+            text = self._completion_to_text(completion)
             pred = extract_boxed_answer(text)
             if pred is not None and is_equiv(pred, gold):
                 rewards.append(1.0)
             else:
                 rewards.append(0.0)
 
-        # Group by prompt (every num_generations entries) and detect all-wrong
-        G = self.num_generations
-        for i in range(0, len(rewards), G):
-            group_rewards = rewards[i : i + G]
+        # Group by prompt identity (robust to DDP splitting / ordering)
+        from collections import OrderedDict
+        groups = OrderedDict()  # key -> {prompt, answer, rewards, completions}
+        for idx in range(len(rewards)):
+            prompt = prompts[idx] if prompts is not None else None
+            key = (self._prompt_key(prompt), answer[idx])
+            if key not in groups:
+                groups[key] = {
+                    "prompt": prompt,
+                    "answer": answer[idx],
+                    "rewards": [],
+                    "completions": [],
+                }
+            groups[key]["rewards"].append(rewards[idx])
+            groups[key]["completions"].append(
+                self._completion_to_text(completions[idx])
+            )
+
+        step = (
+            kwargs.get("trainer_state", None)
+            and kwargs["trainer_state"].global_step
+        )
+        for group in groups.values():
             self.total_prompts += 1
-            if sum(group_rewards) == 0.0:
+            if sum(group["rewards"]) == 0.0:
                 self.all_wrong_prompts += 1
-                # Save prompt + answer for power-sampling recovery
                 entry = {
-                    "prompt": prompts[i] if prompts is not None else None,
-                    "answer": answer[i],
-                    "step": kwargs.get("trainer_state", None)
-                    and kwargs["trainer_state"].global_step,
+                    "prompt": group["prompt"],
+                    "answer": group["answer"],
+                    "completions": group["completions"],
+                    "step": step,
                 }
                 with open(self.buffer_path, "a") as f:
                     f.write(json.dumps(entry) + "\n")
 
-            # Log running stats every 100 prompts
             if self.total_prompts % 100 == 0:
                 pct = 100 * self.all_wrong_prompts / self.total_prompts
                 print(
@@ -89,6 +120,172 @@ class AccuracyRewardWithBuffer:
                 )
 
         return rewards
+
+
+# ---------------------------------------------------------------------------
+# Recovery: GRPOTrainer that trains on pre-computed rollout batches
+# ---------------------------------------------------------------------------
+
+def _pad_tensors(tensors, padding_value, side="right"):
+    """Pad a list of 1-D tensors to equal length."""
+    max_len = max(t.size(0) for t in tensors)
+    out = torch.full((len(tensors), max_len), padding_value, dtype=tensors[0].dtype)
+    for i, t in enumerate(tensors):
+        if side == "right":
+            out[i, : t.size(0)] = t
+        else:
+            out[i, max_len - t.size(0) :] = t
+    return out
+
+
+def load_recovered_dataset(path: str, num_generations: int) -> Dataset:
+    """Load recovered_buffer.jsonl into a HF Dataset for recovery training.
+
+    Each entry has: prompt (chat messages), answer, completions (variable-length
+    wrong rollouts), power_response (1 correct).  We pad/truncate wrong
+    completions to exactly G-1 by repeating if needed, then append the correct
+    one so every group has exactly G completions.
+    """
+    G = num_generations
+    rows = []
+    with open(path) as f:
+        for line in f:
+            entry = json.loads(line)
+            wrongs = entry["completions"]
+            # Pad to G-1 by cycling, or truncate
+            if len(wrongs) == 0:
+                continue  # can't build a group with no wrong completions
+            if len(wrongs) < G - 1:
+                repeats = (G - 1) // len(wrongs) + 1
+                wrongs = (wrongs * repeats)[: G - 1]
+            else:
+                wrongs = wrongs[: G - 1]
+            stored = wrongs + [entry["power_response"]]
+            rows.append({
+                "prompt": entry["prompt"],
+                "answer": entry["answer"],
+                "stored_completions": stored,
+            })
+    print(f"Loaded {len(rows)} recovered entries from {path}")
+    return Dataset.from_list(rows)
+
+
+class GRPOWithRecovery(GRPOTrainer):
+    """GRPOTrainer that can train on pre-computed recovery rollouts.
+
+    When the dataset contains a ``stored_completions`` column, generation is
+    skipped and the stored completions are used directly.  Rewards are set to
+    [0, ..., 0, 1] (last completion is the power-sampled correct one) and
+    advantages are computed as usual.
+
+    NOTE: currently single-GPU only for recovery mode.
+    """
+
+    def _generate_and_score_completions(self, inputs):
+        # Normal GRPO path when no stored completions
+        if "stored_completions" not in inputs[0]:
+            return super()._generate_and_score_completions(inputs)
+
+        device = self.accelerator.device
+        mode = "train" if self.model.training else "eval"
+        G = self.num_generations
+        B = len(inputs)
+
+        # --- 1. Tokenize prompts (apply chat template, repeat G times) ---
+        prompt_ids_list = []
+        for inp in inputs:
+            text = self._tokenizer.apply_chat_template(
+                inp["prompt"], tokenize=False, add_generation_prompt=True
+            )
+            ids = self._tokenizer.encode(text)
+            for _ in range(G):
+                prompt_ids_list.append(torch.tensor(ids, dtype=torch.long))
+
+        # --- 2. Tokenize stored completions (G per prompt) ---
+        completion_ids_list = []
+        for inp in inputs:
+            for comp_text in inp["stored_completions"]:
+                ids = self._tokenizer.encode(
+                    comp_text, add_special_tokens=False
+                )
+                ids = ids[: self.max_completion_length]
+                completion_ids_list.append(torch.tensor(ids, dtype=torch.long))
+
+        # --- 3. Pad into tensors ---
+        pad_id = self._tokenizer.pad_token_id
+        prompt_ids = _pad_tensors(prompt_ids_list, pad_id, side="left").to(device)
+        prompt_mask = (prompt_ids != pad_id).long()
+        completion_ids = _pad_tensors(completion_ids_list, pad_id, side="right").to(device)
+        completion_mask = (completion_ids != pad_id).long()
+
+        # --- 4. Forward pass → old_per_token_logps ---
+        input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+        logits_to_keep = completion_ids.size(1)
+
+        with torch.no_grad():
+            old_per_token_logps, _ = self._get_per_token_logps_and_entropies(
+                self.model, input_ids, attention_mask, logits_to_keep,
+                batch_size=self.args.per_device_train_batch_size,
+            )
+
+        # --- 5. Rewards [0,...,0,1] and group-relative advantages ---
+        rewards = torch.zeros(B * G, device=device)
+        for i in range(B):
+            rewards[i * G + G - 1] = 1.0
+
+        mean_r = rewards.view(B, G).mean(dim=1).repeat_interleave(G)
+        std_r = rewards.view(B, G).std(dim=1).repeat_interleave(G)
+        advantages = (rewards - mean_r) / (std_r + 1e-4)
+
+        # --- 6. Ref model logps (if KL penalty) ---
+        ref_per_token_logps = None
+        if self.beta != 0.0:
+            with torch.no_grad():
+                if self.ref_model is not None:
+                    ref_per_token_logps, _ = self._get_per_token_logps_and_entropies(
+                        self.ref_model, input_ids, attention_mask,
+                        logits_to_keep,
+                        batch_size=self.args.per_device_train_batch_size,
+                    )
+                else:
+                    model = self.accelerator.unwrap_model(self.model)
+                    adapter = "ref" if hasattr(model, "peft_config") and "ref" in model.peft_config else None
+                    from contextlib import nullcontext
+                    ctx = nullcontext()
+                    if adapter is not None:
+                        from trl.trainer.utils import use_adapter
+                        ctx = use_adapter(model, adapter_name=adapter)
+                    with ctx:
+                        ref_per_token_logps, _ = self._get_per_token_logps_and_entropies(
+                            self.model, input_ids, attention_mask,
+                            logits_to_keep,
+                            batch_size=self.args.per_device_train_batch_size,
+                        )
+
+        # --- 7. Metrics ---
+        self._metrics[mode]["reward"].append(rewards.mean().item())
+        self._metrics[mode]["reward_std"].append(rewards.std().item())
+        self._metrics[mode][f"rewards/{self.reward_func_names[0]}/mean"].append(
+            rewards.mean().item()
+        )
+        self._metrics[mode][f"rewards/{self.reward_func_names[0]}/std"].append(
+            rewards.std().item()
+        )
+        self._metrics[mode]["frac_reward_zero_std"].append(0.0)
+
+        output = {
+            "prompt_ids": prompt_ids,
+            "prompt_mask": prompt_mask,
+            "completion_ids": completion_ids,
+            "completion_mask": completion_mask,
+            "advantages": advantages,
+            "old_per_token_logps": old_per_token_logps,
+            "num_items_in_batch": B * G,
+        }
+        if ref_per_token_logps is not None:
+            output["ref_per_token_logps"] = ref_per_token_logps
+        return output
 
 
 # ---------------------------------------------------------------------------
@@ -102,7 +299,7 @@ SYSTEM_PROMPT = (
 
 
 def format_grpo(example):
-    """Format a NuminaMath/Polaris example for GRPO.
+    """Format a example for GRPO.
 
     Returns a dict with:
     - prompt: chat messages (system + user) for the model to complete
@@ -151,23 +348,28 @@ def train(args):
             task_type="CAUSAL_LM",
         )
 
-    # Load and format dataset
-    loader = DATASET_REGISTRY_TRAIN[args.dataset]
-    loader_kwargs = dict(max_samples=args.max_samples, seed=args.seed)
-    if args.dataset == "deepmath":
-        loader_kwargs["explode_solutions"] = False
-    if args.dataset == "numinamath" and args.sources:
-        loader_kwargs["sources"] = args.sources
-    if args.dataset == "polaris" and args.difficulty:
-        loader_kwargs["difficulty"] = args.difficulty
-    ds = loader(**loader_kwargs)
-    print(f"Loaded {len(ds)} training examples from {args.dataset}")
+    # Load dataset (normal or recovery mode)
+    recovery_mode = args.recovered_buffer is not None
+    if recovery_mode:
+        ds = load_recovered_dataset(args.recovered_buffer, args.num_generations)
+        print(f"[Recovery] Training on {len(ds)} recovered rollout batches")
+    else:
+        loader = DATASET_REGISTRY_TRAIN[args.dataset]
+        loader_kwargs = dict(max_samples=args.max_samples, seed=args.seed)
+        if args.dataset == "deepmath":
+            loader_kwargs["explode_solutions"] = False
+        if args.dataset == "numinamath" and args.sources:
+            loader_kwargs["sources"] = args.sources
+        if args.dataset == "polaris" and args.difficulty:
+            loader_kwargs["difficulty"] = args.difficulty
+        ds = loader(**loader_kwargs)
+        print(f"Loaded {len(ds)} training examples from {args.dataset}")
 
-    ds = ds.map(
-        format_grpo,
-        remove_columns=[c for c in ds.column_names if c not in ["answer"]],
-        num_proc=4,
-    )
+        ds = ds.map(
+            format_grpo,
+            remove_columns=[c for c in ds.column_names if c not in ["answer"]],
+            num_proc=4,
+        )
 
     # Training config
     training_args = GRPOConfig(
@@ -208,8 +410,9 @@ def train(args):
         buffer_path=buffer_path,
     )
 
-    # Trainer
-    trainer = GRPOTrainer(
+    # Trainer (use recovery subclass when training on recovered rollouts)
+    trainer_cls = GRPOWithRecovery if recovery_mode else GRPOTrainer
+    trainer = trainer_cls(
         model=model,
         args=training_args,
         reward_funcs=reward_fn,
@@ -223,7 +426,7 @@ def train(args):
     effective_batch = args.per_device_batch_size * args.gradient_accumulation_steps * num_devices
     steps_per_epoch = len(ds) // effective_batch
     print(f"\n{'='*60}")
-    print(f"Training plan (GRPO):")
+    print(f"Training plan ({'Recovery GRPO' if recovery_mode else 'GRPO'}):")
     print(f"  Dataset size:        {len(ds)}")
     print(f"  Devices:             {num_devices}")
     print(f"  Per-device batch:    {args.per_device_batch_size}")
@@ -334,6 +537,11 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--chat_template_model", type=str, default=None,
                         help="HF model to borrow chat template from (e.g. instruct variant for a base model)")
+
+    # Recovery (Phase 3)
+    parser.add_argument("--recovered_buffer", type=str, default=None,
+                        help="Path to recovered_buffer.jsonl from power sampling. "
+                             "Trains on recovered rollouts instead of generating new ones.")
 
     args = parser.parse_args()
 
